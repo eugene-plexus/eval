@@ -15,6 +15,8 @@ def test_get_config_schema_lists_eval_fields(client: TestClient) -> None:
     # EUGENE_PLEXUS_EVAL_BIND_PORT.
     assert keys == {
         "evalRoot",
+        "checkpointsDir",
+        "dataRoot",
         "defaultSamplingTemperature",
         "minLogitEntropy",
         "logLevel",

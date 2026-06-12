@@ -26,17 +26,30 @@ Plus the standard Eugene Plexus config trio (`GET /v1/config`,
 `GET /v1/config/schema`, `PATCH /v1/config`), `POST /v1/config/test`,
 `POST /v1/admin/restart`, and `GET /healthz`.
 
-## v0.3 skeleton status
+## Eval engine
 
-This repo currently ships the **control-plane skeleton**: the HTTP wire
-shape (routes + generated models + config + auth + health + safe mode) is
-complete, but the actual eval-execution engine is **not implemented
-yet**. The run-control endpoints (`POST /v1/eval/runs`,
-`GET /v1/eval/runs/{evalRunId}`, `POST /v1/eval/compare`) return `501 Not
-Implemented` with a standard `Problem` body explaining that the eval
-engine is future work. The suite-listing endpoints return empty / real
-responses: `GET /v1/eval/suites` returns an empty list, and the suite
-CRUD shapes are the long-term contract.
+The eval engine is implemented. It persists eval suites, then runs a suite
+against a checkpoint and reports metrics:
+
+- **`val_loss`** — mean next-token cross-entropy over a validation dataset
+  (resolved under `dataRoot` from the suite's `validationDatasetId`).
+- **`perplexity`** — `exp(val_loss)`.
+- **`token_entropy`** — Shannon entropy (nats) of the tokens generated across
+  the suite's prompts; a mode-collapse signal (low = the model keeps emitting
+  the same few tokens).
+- **`sample_review`** — a generated continuation per prompt, for qualitative
+  review.
+
+A run loads the same **self-describing checkpoint** the trainer writes
+(rebuilding the model standalone from `meta.architecture` + `meta.tokenizer`),
+resolved under `checkpointsDir` as `<checkpointId>.pt` (or
+`<checkpointId>/latest.pt`). `POST /v1/eval/compare` runs a suite against two
+checkpoints and returns both results — the seeded validation loader feeds both
+the same batches, so the comparison is fair. Runs are synchronous (the small
+local models this targets evaluate in seconds).
+
+**v0.3 first-cut limits** (each a clean follow-up): CPU only; runs synchronously
+(no async run queue); the validation batch count is a fixed internal default.
 
 ## Quick start
 
@@ -54,9 +67,11 @@ by hand.
 
 Per the project-wide rule (`feedback_degraded_mode_required.md`), a bad
 config never prevents the component from starting. Config endpoints stay
-reachable so operators can fix the broken setting through the UI;
-domain endpoints behave according to the skeleton (501) until the
-eval engine lands.
+reachable so operators can fix the broken setting through the UI. The
+engine builds without torch present (it's imported lazily on first run), so
+the control plane always comes up; in **safe mode**
+(`EUGENE_PLEXUS_EVAL_SAFE_MODE=1`) eval execution is disabled and the
+run/compare routes return `503` while config stays editable.
 
 ## Codegen
 

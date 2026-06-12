@@ -29,6 +29,12 @@ dependencies = [
     "pydantic-settings>=2.6,<3",
     "pyyaml>=6.0,<7",
     "pyjwt>=2.9,<3",
+    # Eval deps. Imported lazily by the engine so the control plane (config,
+    # health, suite listing) boots even if they're absent; an eval run then
+    # fails with a clear error. CI installs the CPU-only torch wheel.
+    "torch>=2.4",
+    "tokenizers>=0.20,<1",
+    "pyarrow>=18,<22",
 ]
 
 [project.optional-dependencies]
@@ -96,7 +102,11 @@ python_version = "3.12"
 disable_error_code = ["call-arg"]
 warn_unused_configs = true
 warn_unused_ignores = true
-warn_return_any = true
+# torch types nn.Module.__call__ (and much else) as returning Any, so a
+# faithful return of a Tensor reads as "returning Any" to mypy. Disabled
+# deliberately for the torch-heavy eval engine rather than scattering casts;
+# ruff + tests retain the mistype-detection role.
+warn_return_any = false
 warn_redundant_casts = true
 disallow_untyped_defs = true
 no_implicit_optional = true
@@ -108,6 +118,11 @@ exclude = [
 [[tool.mypy.overrides]]
 module = "eugene_plexus_eval._generated.*"
 ignore_errors = true
+
+# tokenizers and pyarrow ship no type stubs.
+[[tool.mypy.overrides]]
+module = ["tokenizers.*", "pyarrow.*"]
+ignore_missing_imports = true
 
 # -----------------------------------------------------------------------------
 # Pytest

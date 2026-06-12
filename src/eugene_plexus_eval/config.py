@@ -59,6 +59,39 @@ FIELDS: list[ConfigField] = [
         category="paths",
         valueType=ConfigValueType.file_path,
         default="eval-output",
+        # The engine loads its in-memory suite registry from this directory at
+        # construction, so a change only takes effect on restart. (checkpointsDir
+        # / dataRoot are read live per run and so are not restart-gated.)
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key="checkpointsDir",
+        label="Checkpoints directory",
+        description=(
+            "Filesystem directory on the eval host where checkpoints to "
+            "evaluate are read from. A run resolves its `checkpointId` to "
+            "`<checkpointsDir>/<checkpointId>.pt` (or "
+            "`<checkpointId>/latest.pt`). The coordinator places the "
+            "trainer's checkpoint here before requesting an eval. Use an "
+            "absolute path; created automatically if absent."
+        ),
+        category="paths",
+        valueType=ConfigValueType.file_path,
+        default="eval-checkpoints",
+    ),
+    ConfigField(
+        key="dataRoot",
+        label="Data root",
+        description=(
+            "Filesystem directory holding the data component's datasets, used "
+            "to resolve a suite's `validationDatasetId` to its pretokenized "
+            "Arrow blocks (`<dataRoot>/datasets/<id>/arrow/`) for val-loss / "
+            "perplexity. Only needed for suites with a validation dataset. Use "
+            "an absolute path."
+        ),
+        category="paths",
+        valueType=ConfigValueType.file_path,
+        default="data-root",
     ),
     ConfigField(
         key="defaultSamplingTemperature",
