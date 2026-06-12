@@ -20,12 +20,9 @@ from .settings import Settings, load_settings
 
 log = logging.getLogger(__name__)
 
-# The v0.3 skeleton ships no eval engine. `app.state.engine` stays None and
-# run-control routes return 501; `engine_error` explains why in /healthz
-# details. When the engine lands the lifespan builds it here and routes
-# flip from 501 to real behavior.
-_SKELETON_ENGINE_ERROR = (
-    "eval engine not implemented in the v0.3 skeleton; run-control endpoints return 501"
+_SAFE_MODE_ENGINE_ERROR = (
+    "safe mode active (EUGENE_PLEXUS_EVAL_SAFE_MODE=1): eval execution is disabled; "
+    "config endpoints remain reachable. Fix config and restart without the env var."
 )
 
 
@@ -56,15 +53,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             master_key_b64=settings.master_key,
         )
 
-    # The eval-execution engine is future work. We wire `app.state.engine`
-    # (None for now) and an explanatory `engine_error` so /healthz reports
-    # `degraded` and the run-control routes have a uniform place to check.
-    # When the engine is implemented this is where it gets built — and a
-    # build failure here surfaces as degraded mode instead of crashing the
-    # process, per feedback_degraded_mode_required.md.
+    # Build the eval engine. Construction is torch-free (it reads config + the
+    # persisted suites); torch / tokenizers / pyarrow are imported lazily on the
+    # first run, so the control plane boots without them. Safe mode leaves the
+    # engine unbuilt (eval disabled, config reachable); an unexpected build
+    # failure also degrades rather than crashing, per
+    # feedback_degraded_mode_required.md. Tests may pre-populate
+    # `app.state.engine`.
     if not hasattr(app.state, "engine"):
-        app.state.engine = None
-        app.state.engine_error = _SKELETON_ENGINE_ERROR
+        if settings.safe_mode:
+            app.state.engine = None
+            app.state.engine_error = _SAFE_MODE_ENGINE_ERROR
+        else:
+            try:
+                from .engine.engine import EvalEngine
+
+                app.state.engine = EvalEngine(config_store, device="cpu")
+                app.state.engine_error = None
+            except Exception as e:  # pragma: no cover - defensive degrade
+                log.exception("failed to build the eval engine; starting degraded")
+                app.state.engine = None
+                app.state.engine_error = f"engine initialization failed: {e}"
 
     yield
 
@@ -76,8 +85,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="Eugene Plexus — eval",
         description=(
-            "Checkpoint evaluation engine. v0.3 skeleton ships the "
-            "control-plane wire shape; the eval engine is future work."
+            "Checkpoint evaluation engine: runs eval suites (val-loss / "
+            "perplexity / token-entropy / sample-review) against a checkpoint. "
+            "CPU, synchronous in this first cut."
         ),
         version=__version__,
         lifespan=_lifespan,

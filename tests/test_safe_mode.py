@@ -72,3 +72,38 @@ def test_patch_config_writes_to_disk_in_safe_mode(
 
     on_disk = yaml.safe_load(safe_mode_settings.config_file.read_text(encoding="utf-8"))
     assert on_disk["logLevel"] == "WARNING"
+
+
+def test_executing_endpoints_return_503_in_safe_mode(safe_mode_client: TestClient) -> None:
+    from uuid import uuid4
+
+    run = safe_mode_client.post(
+        "/v1/eval/runs", json={"evalSuiteId": str(uuid4()), "checkpointId": str(uuid4())}
+    )
+    assert run.status_code == 503
+    assert run.json()["component"] == "eval"
+    assert run.headers["content-type"].startswith("application/problem+json")
+
+    compare = safe_mode_client.post(
+        "/v1/eval/compare",
+        json={
+            "evalSuiteId": str(uuid4()),
+            "baselineCheckpointId": str(uuid4()),
+            "candidateCheckpointId": str(uuid4()),
+        },
+    )
+    assert compare.status_code == 503
+
+    create = safe_mode_client.post(
+        "/v1/eval/suites",
+        json={"evalSuiteId": str(uuid4()), "name": "x", "metrics": ["perplexity"]},
+    )
+    assert create.status_code == 503
+
+
+def test_suite_list_degrades_to_empty_in_safe_mode(safe_mode_client: TestClient) -> None:
+    # The read endpoint stays available (returns an empty list) even with the
+    # engine unbuilt, so callers polling for suites get a valid result.
+    response = safe_mode_client.get("/v1/eval/suites")
+    assert response.status_code == 200
+    assert response.json() == {"suites": []}

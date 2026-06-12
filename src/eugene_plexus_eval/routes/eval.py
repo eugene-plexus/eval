@@ -1,19 +1,9 @@
-"""Eval domain routes: eval suites + eval runs + checkpoint comparison.
+"""Eval domain routes: eval suites (persisted CRUD) + eval runs + compare.
 
-v0.3 SKELETON. The real eval-execution engine is not implemented yet, so
-the endpoints that need a running engine (start an eval run, read a run's
-result, compare two checkpoints) return `501 Not Implemented` with a
-standard `Problem` body. The endpoints whose answer doesn't depend on a
-running engine are real:
-
-  * `GET /v1/eval/suites` returns an empty list (no suites persisted yet).
-  * `POST /v1/eval/suites` echoes back the created suite (the wire shape;
-    real persistence lands with the engine).
-  * `GET /v1/eval/suites/{id}` 404s (nothing persisted yet).
-  * `DELETE /v1/eval/suites/{id}` 404s (nothing persisted yet).
-
-When the engine lands it replaces the 501s and wires real suite storage;
-the wire shapes here are the long-term contract.
+The run/compare handlers are plain ``def`` (not ``async``) so FastAPI runs the
+blocking eval (model forward + generation) in a worker thread. Suite reads
+answer with empty/own shapes even when the engine is unavailable (safe mode /
+degraded); the executing endpoints return ``503`` with a ``Problem`` body.
 """
 
 from __future__ import annotations
@@ -21,54 +11,57 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Request, Response, status
+from fastapi.responses import JSONResponse
 
 from .._generated.common_models import Problem
 from .._generated.models import (
     EvalSuite,
     V1EvalComparePostRequest,
+    V1EvalComparePostResponse,
     V1EvalRunsPostRequest,
     V1EvalSuitesGetResponse,
 )
+from ..engine.engine import BadRequestError, ConflictError, EvalEngine, EvalError, NotFoundError
 
 router = APIRouter(tags=["eval"])
 
-_ENGINE_NOT_IMPLEMENTED = (
-    "eval execution engine not implemented in the v0.3 skeleton; "
-    "this repo ships the control-plane wire shape only"
-)
+_ERR_STATUS: list[tuple[type[EvalError], int]] = [
+    (NotFoundError, status.HTTP_404_NOT_FOUND),
+    (ConflictError, status.HTTP_409_CONFLICT),
+    (BadRequestError, status.HTTP_400_BAD_REQUEST),
+]
 
 
-def _not_implemented(operation: str) -> Response:
-    problem = Problem(
-        type="https://github.com/eugene-plexus/eval#engine-not-implemented",
-        title="Eval engine not implemented",
-        status=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=f"{operation}: {_ENGINE_NOT_IMPLEMENTED}.",
+def _problem(status_code: int, title: str, detail: str) -> JSONResponse:
+    slug = title.replace(" ", "-").lower()
+    body = Problem(
+        type=f"https://github.com/eugene-plexus/eval#{slug}",
+        title=title,
+        status=status_code,
+        detail=detail,
         component="eval",
     )
-    return Response(
-        content=problem.model_dump_json(exclude_none=True),
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+    return JSONResponse(
+        status_code=status_code,
         media_type="application/problem+json",
+        content=body.model_dump(exclude_none=True),
     )
 
 
-def _not_found(operation: str, resource_id: UUID) -> Response:
-    problem = Problem(
-        type="https://github.com/eugene-plexus/eval#not-found",
-        title="Not found",
-        status=status.HTTP_404_NOT_FOUND,
-        detail=(
-            f"{operation}: no such resource {resource_id} — the v0.3 skeleton "
-            "persists no eval suites or runs yet."
-        ),
-        component="eval",
+def _engine_error(e: EvalError) -> JSONResponse:
+    code = next(
+        (c for cls, c in _ERR_STATUS if isinstance(e, cls)), status.HTTP_500_INTERNAL_SERVER_ERROR
     )
-    return Response(
-        content=problem.model_dump_json(exclude_none=True),
-        status_code=status.HTTP_404_NOT_FOUND,
-        media_type="application/problem+json",
-    )
+    return _problem(code, type(e).__name__, str(e))
+
+
+def _engine(request: Request) -> EvalEngine | None:
+    return getattr(request.app.state, "engine", None)
+
+
+def _unavailable(request: Request) -> JSONResponse:
+    detail = getattr(request.app.state, "engine_error", None) or "eval is unavailable"
+    return _problem(status.HTTP_503_SERVICE_UNAVAILABLE, "Eval unavailable", detail)
 
 
 # --------------------------------------------------------------------------- #
@@ -77,46 +70,95 @@ def _not_found(operation: str, resource_id: UUID) -> Response:
 
 
 @router.get("/v1/eval/suites", response_model=V1EvalSuitesGetResponse)
-async def list_eval_suites(request: Request) -> V1EvalSuitesGetResponse:
-    """List eval suites. The skeleton persists no suites yet — returns an
-    empty list rather than 501 so callers polling for suites get a valid
-    empty result."""
-    return V1EvalSuitesGetResponse(suites=[])
+def list_eval_suites(request: Request) -> V1EvalSuitesGetResponse:
+    engine = _engine(request)
+    suites = engine.list_suites() if engine else []
+    return V1EvalSuitesGetResponse(suites=suites)
 
 
-@router.post("/v1/eval/suites", response_model=EvalSuite, status_code=status.HTTP_201_CREATED)
-async def create_eval_suite(request: Request, body: EvalSuite) -> EvalSuite:
-    """Create an eval suite. The skeleton has no persistence layer, so it
-    validates and echoes the suite back in the long-term wire shape; the
-    engine work adds storage."""
-    return body
+@router.post("/v1/eval/suites", status_code=status.HTTP_201_CREATED)
+def create_eval_suite(request: Request, body: EvalSuite) -> Response:
+    engine = _engine(request)
+    if engine is None:
+        return _unavailable(request)
+    try:
+        suite = engine.create_suite(body)
+    except EvalError as e:
+        return _engine_error(e)
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content=suite.model_dump(mode="json", exclude_none=True),
+    )
 
 
-@router.get("/v1/eval/suites/{eval_suite_id}", response_model=EvalSuite)
-async def get_eval_suite(request: Request, eval_suite_id: UUID) -> Response:
-    return _not_found("getEvalSuite", eval_suite_id)
+@router.get("/v1/eval/suites/{eval_suite_id}")
+def get_eval_suite(request: Request, eval_suite_id: UUID) -> Response:
+    engine = _engine(request)
+    if engine is None:
+        return _unavailable(request)
+    try:
+        suite = engine.get_suite(eval_suite_id)
+    except EvalError as e:
+        return _engine_error(e)
+    return JSONResponse(content=suite.model_dump(mode="json", exclude_none=True))
 
 
 @router.delete("/v1/eval/suites/{eval_suite_id}", status_code=204)
-async def delete_eval_suite(request: Request, eval_suite_id: UUID) -> Response:
-    return _not_found("deleteEvalSuite", eval_suite_id)
+def delete_eval_suite(request: Request, eval_suite_id: UUID) -> Response:
+    engine = _engine(request)
+    if engine is None:
+        return _unavailable(request)
+    try:
+        engine.delete_suite(eval_suite_id)
+    except EvalError as e:
+        return _engine_error(e)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --------------------------------------------------------------------------- #
-# Eval runs + compare (engine-dependent: 501 in the skeleton)
+# Eval runs + compare
 # --------------------------------------------------------------------------- #
 
 
-@router.post("/v1/eval/runs", status_code=202)
-async def start_eval_run(request: Request, body: V1EvalRunsPostRequest) -> Response:
-    return _not_implemented("startEvalRun")
+@router.post("/v1/eval/runs", status_code=status.HTTP_202_ACCEPTED)
+def start_eval_run(request: Request, body: V1EvalRunsPostRequest) -> Response:
+    engine = _engine(request)
+    if engine is None:
+        return _unavailable(request)
+    try:
+        result = engine.run_eval(eval_suite_id=body.evalSuiteId, checkpoint_id=body.checkpointId)
+    except EvalError as e:
+        return _engine_error(e)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content=result.model_dump(mode="json", exclude_none=True),
+    )
 
 
 @router.get("/v1/eval/runs/{eval_run_id}")
-async def get_eval_result(request: Request, eval_run_id: UUID) -> Response:
-    return _not_implemented("getEvalResult")
+def get_eval_result(request: Request, eval_run_id: UUID) -> Response:
+    engine = _engine(request)
+    if engine is None:
+        return _unavailable(request)
+    try:
+        result = engine.get_result(eval_run_id)
+    except EvalError as e:
+        return _engine_error(e)
+    return JSONResponse(content=result.model_dump(mode="json", exclude_none=True))
 
 
 @router.post("/v1/eval/compare")
-async def compare_checkpoints(request: Request, body: V1EvalComparePostRequest) -> Response:
-    return _not_implemented("compareCheckpoints")
+def compare_checkpoints(request: Request, body: V1EvalComparePostRequest) -> Response:
+    engine = _engine(request)
+    if engine is None:
+        return _unavailable(request)
+    try:
+        baseline, candidate = engine.compare(
+            eval_suite_id=body.evalSuiteId,
+            baseline_checkpoint_id=body.baselineCheckpointId,
+            candidate_checkpoint_id=body.candidateCheckpointId,
+        )
+    except EvalError as e:
+        return _engine_error(e)
+    response = V1EvalComparePostResponse(baseline=baseline, candidate=candidate)
+    return JSONResponse(content=response.model_dump(mode="json", exclude_none=True))
